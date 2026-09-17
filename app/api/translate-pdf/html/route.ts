@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { translatePageToHtml } from "@/lib/gemini";
-import { loadPdfDocument, renderPageToJpeg } from "@/lib/pdfRaster";
+import { loadPdfDocument, renderPageToJpeg, renderPageHalfToJpeg, getPageDimensions } from "@/lib/pdfRaster";
 import { sanitizeTranslatedHtml } from "@/lib/sanitizeHtml";
+import { injectLandDiagram } from "@/lib/landDiagram";
 import { requireFile, assertMagicBytes, assertFileSize, handleApiError, ApiError, SIZE_LIMITS } from "@/lib/apiValidation";
 
 export const runtime = "nodejs";
@@ -53,24 +54,41 @@ export async function POST(req: NextRequest) {
     if (numPages > MAX_TRANSLATE_PAGES) {
       throw new ApiError(`PDF có ${numPages} trang, vượt quá giới hạn ${MAX_TRANSLATE_PAGES} trang cho mỗi lần dịch.`, 400);
     }
-    const pageIndices = Array.from({ length: numPages }, (_, i) => i);
-
-    const translatedPages = await mapWithConcurrency(pageIndices, 4, async (pageIndex): Promise<TranslatedPage> => {
+    // A landscape sheet ~1.4x wider than tall (A4 rotated: 841.89x595.27pt) is
+    // typically two A4 portrait halves glued together (Vietnamese land-title
+    // booklets scan this way) — split it into two jobs so each half becomes
+    // its own properly laid-out A4 output page instead of one cramped page.
+    type RenderJob = { pageNum: number; half?: "left" | "right" };
+    const jobs: RenderJob[] = [];
+    for (let pageIndex = 0; pageIndex < numPages; pageIndex++) {
       const pageNum = pageIndex + 1;
+      const { width, height } = await getPageDimensions(pdfDoc, pageNum);
+      if (width / height > 1.3) {
+        jobs.push({ pageNum, half: "left" }, { pageNum, half: "right" });
+      } else {
+        jobs.push({ pageNum });
+      }
+    }
+
+    const translatedPages = await mapWithConcurrency(jobs, 4, async (job, jobIndex): Promise<TranslatedPage> => {
       let html = "";
       try {
-        const { buffer } = await renderPageToJpeg(pdfDoc, pageNum, RENDER_ZOOM, 0.92);
+        const { buffer } = job.half
+          ? await renderPageHalfToJpeg(pdfDoc, job.pageNum, RENDER_ZOOM, job.half, 0.92)
+          : await renderPageToJpeg(pdfDoc, job.pageNum, RENDER_ZOOM, 0.92);
         html = await translatePageToHtml(buffer.toString("base64"), "image/jpeg");
       } catch (err) {
-        console.error(`Translate page ${pageNum} failed:`, err);
+        console.error(`Translate page ${job.pageNum}${job.half ? `(${job.half})` : ""} failed:`, err);
       }
       if (!html) html = "<p style='color:#e53e3e;text-align:center;'>Translation failed for this page.</p>";
+      else html = injectLandDiagram(html);
+      const outputPageNum = jobIndex + 1;
       return {
-        page_num: pageNum,
+        page_num: outputPageNum,
         translated_html: sanitizeTranslatedHtml(html),
-        group_id: pageNum,
-        is_group_lead: true,
-        group_pages: [pageNum],
+        group_id: job.pageNum,
+        is_group_lead: !job.half || job.half === "left",
+        group_pages: [outputPageNum],
       };
     });
 

@@ -3,6 +3,7 @@ import sanitizeHtml from "sanitize-html";
 const ALLOWED_TAGS = [
   "p", "div", "span", "table", "thead", "tbody", "tr", "td", "th",
   "b", "strong", "i", "em", "br", "ul", "ol", "li", "h1", "h2", "h3", "h4", "h5", "h6",
+  "img",
 ];
 
 /**
@@ -17,7 +18,12 @@ export function sanitizeTranslatedHtml(html: string): string {
     allowedTags: ALLOWED_TAGS,
     allowedAttributes: {
       "*": ["style"],
+      img: ["src", "style"],
     },
+    allowedSchemesAppliedToAttributes: ["src"],
+    // Only our own server-generated data:image/png diagrams ever reach `src` —
+    // it's set by injectLandDiagram(), never taken from Gemini's raw output.
+    allowedSchemes: ["data"],
     allowedStyles: {
       "*": {
         "text-align": [/^left$|^right$|^center$|^justify$/],

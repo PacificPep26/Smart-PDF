@@ -1,6 +1,13 @@
 import * as cheerio from "cheerio";
 import type { Element, AnyNode } from "domhandler";
-import { Document, Packer, Paragraph, Table, TableRow, TableCell, TextRun, AlignmentType, WidthType, BorderStyle, ShadingType } from "docx";
+import { Document, Packer, Paragraph, Table, TableRow, TableCell, TextRun, ImageRun, AlignmentType, WidthType, BorderStyle, ShadingType } from "docx";
+
+/** data:image/png;base64,.... -> raw PNG bytes, or undefined if not a data URI we recognize. */
+function decodeDataUriPng(src: string | undefined): Buffer | undefined {
+  if (!src) return undefined;
+  const m = src.match(/^data:image\/png;base64,([a-z0-9+/=]+)$/i);
+  return m ? Buffer.from(m[1], "base64") : undefined;
+}
 
 function parseInlineStyle(style: string | undefined): Record<string, string> {
   const out: Record<string, string> = {};
@@ -94,40 +101,103 @@ function alignmentFromStyle(style: Record<string, string>): (typeof AlignmentTyp
   return undefined;
 }
 
+function imageParagraph($: ReturnType<typeof cheerio.load>, imgEl: Element): Paragraph | undefined {
+  const png = decodeDataUriPng($(imgEl).attr("src"));
+  if (!png) return undefined;
+  return new Paragraph({
+    alignment: AlignmentType.CENTER,
+    children: [new ImageRun({ data: png, type: "png", transformation: { width: 280, height: 280 } })],
+  });
+}
+
+/** <tr> elements that belong directly to `tableEl` — not to any table nested inside one of its cells. */
+function ownRows($: ReturnType<typeof cheerio.load>, tableEl: Element): Element[] {
+  return $(tableEl)
+    .find("tr")
+    .filter((_, tr) => $(tr).closest("table").get(0) === tableEl)
+    .toArray();
+}
+
+/** <td>/<th> elements that belong directly to `tr` — not to any table nested inside one of its cells. */
+function ownCells($: ReturnType<typeof cheerio.load>, tr: Element): Element[] {
+  return $(tr)
+    .find("td, th")
+    .filter((_, cell) => $(cell).closest("tr").get(0) === tr)
+    .toArray();
+}
+
+/** Flattens <div> wrappers so their <p>/<img>/<table> children become direct block-level items (a <div> itself isn't a paragraph — it's just a grouping wrapper). */
+function flattenBlockChildren($: ReturnType<typeof cheerio.load>, parent: Element): Element[] {
+  const out: Element[] = [];
+  $(parent)
+    .children()
+    .each((_, c) => {
+      const tag = c.tagName?.toLowerCase();
+      if (tag === "div") out.push(...flattenBlockChildren($, c));
+      else if (["p", "img", "table"].includes(tag ?? "")) out.push(c);
+    });
+  return out;
+}
+
+/** A table cell's content, as Paragraphs/nested Tables — handles plain inline text, <p>/<img> children (e.g. a heading followed by a diagram image), and a <table> nested inside the cell. */
+function cellContent($: ReturnType<typeof cheerio.load>, td: Element, base: Partial<RunStyle>, alignment: ReturnType<typeof alignmentFromStyle>): (Paragraph | Table)[] {
+  const blockChildren = flattenBlockChildren($, td);
+
+  if (blockChildren.length === 0) {
+    const runs = textRunsFromNode($, td, base);
+    return [new Paragraph({ children: runs.length ? runs : [new TextRun("")], alignment })];
+  }
+
+  const out: (Paragraph | Table)[] = [];
+  for (const child of blockChildren) {
+    const tag = child.tagName?.toLowerCase();
+    if (tag === "table") {
+      out.push(buildTable($, child));
+      continue;
+    }
+    const imgEl = tag === "img" ? child : $(child).find("img").get(0);
+    if (imgEl) {
+      const p = imageParagraph($, imgEl);
+      if (p) out.push(p);
+      continue;
+    }
+    const childStyle = parseInlineStyle($(child).attr("style"));
+    const runs = textRunsFromNode($, child, { ...base, color: toDocxColor(childStyle["color"]) ?? base.color });
+    if (runs.length) out.push(new Paragraph({ children: runs, alignment: alignmentFromStyle(childStyle) ?? alignment }));
+  }
+  return out.length ? out : [new Paragraph({ children: [new TextRun("")], alignment })];
+}
+
 function buildTable($: ReturnType<typeof cheerio.load>, tableEl: Element): Table {
   const style = parseInlineStyle($(tableEl).attr("style"));
   const rows: TableRow[] = [];
-  $(tableEl)
-    .find("tr")
-    .each((_, tr) => {
-      const cells: TableCell[] = [];
-      $(tr)
-        .find("td, th")
-        .each((_, td) => {
-          const cellStyle = parseInlineStyle($(td).attr("style"));
-          const borderless = cellStyle["border"] === "none" || style["border"] === "none";
-          const isHeaderCell = td.tagName?.toLowerCase() === "th";
-          const cellColor = toDocxColor(cellStyle["color"]);
-          const runs = textRunsFromNode($, td, isHeaderCell ? { bold: true, color: cellColor } : { color: cellColor });
-          const alignment = alignmentFromStyle(cellStyle);
-          const fill = toDocxColor(cellStyle["background-color"] ?? cellStyle["background"]);
-          cells.push(
-            new TableCell({
-              children: [new Paragraph({ children: runs.length ? runs : [new TextRun("")], alignment })],
-              shading: fill ? { type: ShadingType.CLEAR, color: "auto", fill } : undefined,
-              borders: borderless
-                ? {
-                    top: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
-                    bottom: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
-                    left: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
-                    right: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
-                  }
-                : undefined,
-            })
-          );
-        });
-      if (cells.length) rows.push(new TableRow({ children: cells }));
-    });
+  for (const tr of ownRows($, tableEl)) {
+    const cells: TableCell[] = [];
+    for (const td of ownCells($, tr)) {
+      const cellStyle = parseInlineStyle($(td).attr("style"));
+      const borderless = cellStyle["border"] === "none" || style["border"] === "none";
+      const isHeaderCell = td.tagName?.toLowerCase() === "th";
+      const cellColor = toDocxColor(cellStyle["color"]);
+      const alignment = alignmentFromStyle(cellStyle);
+      const fill = toDocxColor(cellStyle["background-color"] ?? cellStyle["background"]);
+      const content = cellContent($, td, isHeaderCell ? { bold: true, color: cellColor } : { color: cellColor }, alignment);
+      cells.push(
+        new TableCell({
+          children: content,
+          shading: fill ? { type: ShadingType.CLEAR, color: "auto", fill } : undefined,
+          borders: borderless
+            ? {
+                top: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
+                bottom: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
+                left: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
+                right: { style: BorderStyle.NONE, size: 0, color: "FFFFFF" },
+              }
+            : undefined,
+        })
+      );
+    }
+    if (cells.length) rows.push(new TableRow({ children: cells }));
+  }
 
   return new Table({ rows, width: { size: 100, type: WidthType.PERCENTAGE } });
 }
@@ -138,15 +208,26 @@ function htmlToDocxElements(html: string): (Paragraph | Table)[] {
   const root = $("#root")[0];
   const elements: (Paragraph | Table)[] = [];
 
-  $(root)
-    .children()
-    .each((_, el) => {
+  flattenBlockChildren($, root).forEach((el) => {
       const tag = el.tagName?.toLowerCase();
       if (tag === "table") {
         elements.push(buildTable($, el));
         return;
       }
       const style = parseInlineStyle($(el).attr("style"));
+      const imgEl = tag === "img" ? el : $(el).find("img").get(0);
+      if (imgEl) {
+        const png = decodeDataUriPng($(imgEl).attr("src"));
+        if (png) {
+          elements.push(
+            new Paragraph({
+              alignment: AlignmentType.CENTER,
+              children: [new ImageRun({ data: png, type: "png", transformation: { width: 280, height: 280 } })],
+            })
+          );
+        }
+        return;
+      }
       const bold = style["font-weight"] === "bold" || Number(style["font-weight"]) >= 600;
       const runs = textRunsFromNode($, el, { bold, color: toDocxColor(style["color"]), size: toDocxHalfPoints(style["font-size"]) });
       if (runs.length === 0) return;
