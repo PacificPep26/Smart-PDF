@@ -7,9 +7,9 @@ export type FileValidationOptions = {
 };
 
 export const CLIENT_SIZE_LIMITS = {
-  pdf: 100 * 1024 * 1024,
-  image: 100 * 1024 * 1024,
-  docx: 100 * 1024 * 1024,
+  pdf: 500 * 1024 * 1024,
+  image: 500 * 1024 * 1024,
+  docx: 500 * 1024 * 1024,
 };
 
 /**
